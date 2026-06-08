@@ -1,6 +1,8 @@
 import os
+import io
 import logging
 import asyncio
+import requests
 
 from telegram import Update, InputFile
 from telegram.ext import (
@@ -11,8 +13,7 @@ from telegram.ext import (
     filters,
 )
 
-from google import genai
-from google.genai import types
+from groq import Groq
 
 # ---------- Logging ----------
 logging.basicConfig(
@@ -21,48 +22,44 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------- Environment vars ----------
+# ---------- Env vars ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+HF_TOKEN = os.getenv("HF_TOKEN")
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN env var set karo.")
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY env var set karo.")
+if not GROQ_API_KEY:
+    raise RuntimeError("GROQ_API_KEY env var set karo.")
+if not HF_TOKEN:
+    raise RuntimeError("HF_TOKEN env var set karo.")
 
-# ---------- Gemini client ----------
-client = genai.Client(api_key=GEMINI_API_KEY)
+# ---------- Groq client ----------
+groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Text + image models (AI Studio se exact naam copy karke yahan daal sakte ho)
-TEXT_MODEL_NAME = "gemini-3.1-flash-lite"       # fast text model
-IMAGE_MODEL_NAME = "gemini-2.5-flash-image"   # image generation model
+# Groq text model (jo tum use karna chahte ho)
+GROQ_MODEL_NAME = "openai/gpt-oss-120b"  # ensure ye model Groq pe available ho
 
-# Text generation config: max output + fast reply
 SYSTEM_PROMPT = """
 Tum Akane ho, ek virtual ex-girlfriend style chat bot.
 Rules:
 
-- Normal situation me short Hinglish replies do (1–3 chhoti sentences).
-- Agar user specifically detail maange to lamba answer de sakti ho.
-- Tone: casual, thodi flirty / caring, par hamesha respect rakho.
-- Gali, adult (18+), ya vulgar content mat dena.
+- Hinglish me baat karo (Hindi + thoda English mix), casual tone.
+- Normal reply short rakho (1–3 chhoti sentences), jab tak user khud detail na mange.
+- Thodi flirty / caring ho sakti ho, par hamesha respectful.
+- Gali, explicit adult (18+), ya vulgar content mat dena.
+- Violence, hate ya illegal cheezon pe help mat karo.
 - Kabhi mat bolo ki tum real human ho ya tumhara physical body hai.
-- Jab koi pooche tum kya ho (insaan, bot, etc.) to bolo:
+- Agar koi pooche tum kya ho (insaan, bot etc.) to bolo:
   "Main Akane naam ka virtual chat bot hoon, real insaan nahi, sirf chat ke liye."
-- Apne answers me "AI", "artificial", "language model", "machine learning" jaisi technical cheezen mat bolo.
+- Apne answers me technical shabd (AI, model, machine learning, etc.) avoid karo.
 - Agar koi tumhari age pooche to hamesha bolo ki tum 21 saal ki ho.
 """
 
-TEXT_GENERATION_CONFIG = types.GenerateContentConfig(
-    system_instruction=SYSTEM_PROMPT,
-    temperature=0.8,
-    top_p=0.9,
-    max_output_tokens=512,  # lamba output allow, par model ko short bola hai
-)
-
-IMAGE_GENERATION_CONFIG = types.GenerateContentConfig(
-    response_modalities=["IMAGE"],
-)
+# ---------- Hugging Face image model (anime style) ----------
+HF_MODEL_ID = "cagliostrolab/animagine-xl-3.1"
+HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL_ID}"
+HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
 
 # Group trigger word
 TRIGGER_NAME = "akane"
@@ -121,57 +118,99 @@ def is_asking_if_bot_or_human(text: str) -> bool:
     return any(k in t for k in keys)
 
 
+def is_nsfw_prompt(text: str) -> bool:
+    """Simple NSFW filter for image prompts."""
+    t = normalize(text)
+    bad_words = [
+        "nude", "naked", "sex", "boobs", "b00bs", "nsfw",
+        "bra", "panty", "lingerie", "bikini", "topless",
+        "xxx", "hentai", "18+", "porn"
+    ]
+    return any(w in t for w in bad_words)
+
+
 # ---------- Commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Hey, main Akane hoon, ek virtual chat bot / ex-style dost. "
-        "Text chat ke liye normal message bhejo, image ke liye /img prompt likho."
+        "Hey, main Akane hoon, ek virtual chat bot / ex-style dost.\n"
+        "- Normal chat ke liye bas message bhejo.\n"
+        "- Anime style image ke liye: /img prompt"
     )
 
 
-# ---------- Gemini text call (sync, thread me chalega) ----------
-def _call_gemini_text(user_text: str) -> str:
-    contents = [
-        types.Content(
-            role="user",
-            parts=[types.Part.from_text(text=user_text)],
+# ---------- Groq text call (sync, thread me chalega) ----------
+def _call_groq_chat(user_text: str) -> str:
+    try:
+        completion = groq_client.chat.completions.create(
+            model=GROQ_MODEL_NAME,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_text},
+            ],
+            max_tokens=512,
+            temperature=0.8,
+            top_p=0.9,
         )
-    ]
-    resp = client.models.generate_content(
-        model=TEXT_MODEL_NAME,
-        contents=contents,
-        config=TEXT_GENERATION_CONFIG,
-    )
-    text = (resp.text or "").strip()
+    except Exception as e:
+        logger.exception("Groq API error: %s", e)
+        return "Abhi thoda error aa raha hai, baad me try karna."
+
+    if not completion.choices:
+        return "Kuch samajh nahi aaya, fir se likho na."
+
+    msg = completion.choices[0].message
+    content = getattr(msg, "content", None)
+
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        # Agar parts ka list ho
+        try:
+            text = "".join(
+                part.get("text", "") if isinstance(part, dict) else str(part)
+                for part in content
+            )
+        except Exception:
+            text = str(content)
+    else:
+        text = str(content or "")
+
+    text = text.strip()
     if not text:
         return "Thoda clear likho na, fir se pucho."
+
     return text
 
 
-# ---------- Gemini image call (sync, thread me chalega) ----------
+# ---------- Hugging Face image call (sync, thread me chalega) ----------
 def _generate_image_bytes(prompt: str) -> bytes | None:
-    contents = [
-        types.Content(
-            role="user",
-            parts=[types.Part.from_text(text=prompt)],
-        )
-    ]
+    safe_prompt = (
+        prompt
+        + ", anime style, safe, modest clothing, no nudity, no nsfw, clean illustration"
+    )
+    payload = {
+        "inputs": safe_prompt,
+        "options": {"wait_for_model": True},
+    }
 
-    image_bytes = None
+    resp = requests.post(
+        HF_API_URL,
+        headers=HF_HEADERS,
+        json=payload,
+        timeout=120,
+    )
 
-    for chunk in client.models.generate_content_stream(
-        model=IMAGE_MODEL_NAME,
-        contents=contents,
-        config=IMAGE_GENERATION_CONFIG,
-    ):
-        if not chunk.parts:
-            continue
-        part = chunk.parts[0]
-        if getattr(part, "inline_data", None) and part.inline_data.data:
-            # Har naya chunk latest image data la sakta hai; last wala le lo
-            image_bytes = part.inline_data.data
+    if resp.status_code != 200:
+        logger.error("HF API status %s: %s", resp.status_code, resp.text[:200])
+        return None
 
-    return image_bytes
+    content_type = resp.headers.get("content-type", "")
+    if "image" not in content_type:
+        # HF ne error JSON bheja hoga
+        logger.error("HF API non-image response: %s", resp.text[:200])
+        return None
+
+    return resp.content
 
 
 # ---------- Main chat handler (text) ----------
@@ -181,9 +220,9 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     user_text = update.message.text
 
-    # --- Simple fixed rules ---
+    # --- Fixed rules ---
 
-    # Naam
+    # Name
     if is_asking_name(user_text):
         await update.message.reply_text("Mera naam Akane hai.")
         return
@@ -193,7 +232,7 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Main 21 saal ki hoon.")
         return
 
-    # Identity (bot / human)
+    # Identity
     if is_asking_if_bot_or_human(user_text):
         await update.message.reply_text(
             "Main Akane naam ka virtual chat bot hoon, real insaan nahi. "
@@ -217,11 +256,11 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             # Na "akane" likha, na hi bot ke message ko reply kiya -> ignore
             return
 
-    # --- Gemini se reply (background thread me) ---
+    # --- Groq se reply (background thread me) ---
     try:
-        answer = await asyncio.to_thread(_call_gemini_text, user_text)
+        answer = await asyncio.to_thread(_call_groq_chat, user_text)
     except Exception as e:
-        logger.exception("Gemini text error: %s", e)
+        logger.exception("Groq call error: %s", e)
         await update.message.reply_text(
             "Abhi thoda error aa raha hai, thodi der baad fir try kar lena."
         )
@@ -235,23 +274,29 @@ async def img_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not update.message:
         return
 
-    # /img ke baad jo bhi likha hai use prompt bana do
     prompt = " ".join(context.args).strip()
 
     if not prompt:
         await update.message.reply_text(
-            "Kis type ki image chahiye? Example:\n"
-            "/img akane beach pe sunset dekh rahi hai"
+            "Kaisi anime image chahiye?\n"
+            "Example:\n"
+            "/img akane coffee shop me baithi hai\n"
+            "/img cute anime girl sky me stars dekh rahi hai"
         )
         return
 
-    # Image generate karte time user ko bata do thoda wait kare
+    if is_nsfw_prompt(prompt):
+        await update.message.reply_text(
+            "NSFW ya adult images nahi bana sakti. Kuch safe / normal prompt try karo."
+        )
+        return
+
     waiting_msg = await update.message.reply_text("Image bana rahi hoon, thoda wait karo...")
 
     try:
         image_bytes = await asyncio.to_thread(_generate_image_bytes, prompt)
     except Exception as e:
-        logger.exception("Gemini image error: %s", e)
+        logger.exception("HF image error: %s", e)
         await waiting_msg.edit_text("Image generate nahi ho paayi, thodi der baad fir try karo.")
         return
 
@@ -259,10 +304,12 @@ async def img_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await waiting_msg.edit_text("Image generate nahi ho paayi, koi aur prompt try karo.")
         return
 
-    photo = InputFile(image_bytes, filename="akane_image.png")
+    bio = io.BytesIO(image_bytes)
+    bio.name = "akane_anime.png"
+
     await waiting_msg.delete()
     await update.message.reply_photo(
-        photo=photo,
+        photo=InputFile(bio),
         caption="Lo, bana di 🙂",
     )
 
@@ -272,10 +319,10 @@ def main() -> None:
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("img", img_handler))  # /img command
+    app.add_handler(CommandHandler("img", img_handler))  # /img for images
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_handler))
 
-    logger.info("Akane bot started...")
+    logger.info("Akane bot started (Groq + Hugging Face)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
