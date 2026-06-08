@@ -34,7 +34,7 @@ if not GEMINI_API_KEY:
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 # Text + image models (AI Studio se exact naam copy karke yahan daal sakte ho)
-TEXT_MODEL_NAME = "gemini-1.5-flash-8b"       # fast text model
+TEXT_MODEL_NAME = "gemini-3.1-flash-lite"       # fast text model
 IMAGE_MODEL_NAME = "gemini-2.5-flash-image"   # image generation model
 
 # Text generation config: max output + fast reply
