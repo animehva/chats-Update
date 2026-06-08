@@ -2,8 +2,8 @@ import os
 import io
 import logging
 import asyncio
-import requests
 
+import requests
 from telegram import Update, InputFile
 from telegram.ext import (
     ApplicationBuilder,
@@ -14,6 +14,7 @@ from telegram.ext import (
 )
 
 from groq import Groq
+from huggingface_hub import InferenceClient
 
 # ---------- Logging ----------
 logging.basicConfig(
@@ -37,8 +38,8 @@ if not HF_TOKEN:
 # ---------- Groq client ----------
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Groq text model (jo tum use karna chahte ho)
-GROQ_MODEL_NAME = "openai/gpt-oss-120b"  # ensure ye model Groq pe available ho
+# Groq text model
+GROQ_MODEL_NAME = "openai/gpt-oss-120b"  # ensure ye model tumhare Groq account pe available ho
 
 SYSTEM_PROMPT = """
 Tum Akane ho, ek virtual ex-girlfriend style chat bot.
@@ -56,10 +57,15 @@ Rules:
 - Agar koi tumhari age pooche to hamesha bolo ki tum 21 saal ki ho.
 """
 
-# ---------- Hugging Face image model (anime style) ----------
-HF_MODEL_ID = "cagliostrolab/animagine-xl-3.1"
-HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL_ID}"
-HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
+# ---------- HF InferenceClient (image) ----------
+# yahi client tumne code me dikhaya tha
+hf_client = InferenceClient(
+    provider="fal-ai",
+    api_key=HF_TOKEN,
+)
+
+# Flux image model (anime / waifu style ke liye prompt me likh sakte ho)
+HF_IMAGE_MODEL = "black-forest-labs/FLUX.1-dev"
 
 # Group trigger word
 TRIGGER_NAME = "akane"
@@ -119,12 +125,11 @@ def is_asking_if_bot_or_human(text: str) -> bool:
 
 
 def is_nsfw_prompt(text: str) -> bool:
-    """Simple NSFW filter for image prompts."""
     t = normalize(text)
     bad_words = [
         "nude", "naked", "sex", "boobs", "b00bs", "nsfw",
         "bra", "panty", "lingerie", "bikini", "topless",
-        "xxx", "hentai", "18+", "porn"
+        "xxx", "hentai", "18+", "porn",
     ]
     return any(w in t for w in bad_words)
 
@@ -133,8 +138,8 @@ def is_nsfw_prompt(text: str) -> bool:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Hey, main Akane hoon, ek virtual chat bot / ex-style dost.\n"
-        "- Normal chat ke liye bas message bhejo.\n"
-        "- Anime style image ke liye: /img prompt"
+        "- Normal chat: bas message likho.\n"
+        "- Anime / waifu style image: /img prompt"
     )
 
 
@@ -164,7 +169,6 @@ def _call_groq_chat(user_text: str) -> str:
     if isinstance(content, str):
         text = content
     elif isinstance(content, list):
-        # Agar parts ka list ho
         try:
             text = "".join(
                 part.get("text", "") if isinstance(part, dict) else str(part)
@@ -182,35 +186,26 @@ def _call_groq_chat(user_text: str) -> str:
     return text
 
 
-# ---------- Hugging Face image call (sync, thread me chalega) ----------
+# ---------- HF image call (sync, thread me chalega) ----------
 def _generate_image_bytes(prompt: str) -> bytes | None:
     safe_prompt = (
         prompt
-        + ", anime style, safe, modest clothing, no nudity, no nsfw, clean illustration"
-    )
-    payload = {
-        "inputs": safe_prompt,
-        "options": {"wait_for_model": True},
-    }
-
-    resp = requests.post(
-        HF_API_URL,
-        headers=HF_HEADERS,
-        json=payload,
-        timeout=120,
+        + ", anime waifu style, high quality, safe, modest clothing, no nudity, no nsfw"
     )
 
-    if resp.status_code != 200:
-        logger.error("HF API status %s: %s", resp.status_code, resp.text[:200])
+    try:
+        # client.text_to_image se PIL.Image milta hai (jaisa tumne snippet me diya)
+        img = hf_client.text_to_image(
+            safe_prompt,
+            model=HF_IMAGE_MODEL,
+        )
+    except Exception as e:
+        logger.exception("HF/Fal image error: %s", e)
         return None
 
-    content_type = resp.headers.get("content-type", "")
-    if "image" not in content_type:
-        # HF ne error JSON bheja hoga
-        logger.error("HF API non-image response: %s", resp.text[:200])
-        return None
-
-    return resp.content
+    bio = io.BytesIO()
+    img.save(bio, format="PNG")
+    return bio.getvalue()
 
 
 # ---------- Main chat handler (text) ----------
@@ -221,18 +216,14 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_text = update.message.text
 
     # --- Fixed rules ---
-
-    # Name
     if is_asking_name(user_text):
         await update.message.reply_text("Mera naam Akane hai.")
         return
 
-    # Age
     if is_asking_age(user_text):
         await update.message.reply_text("Main 21 saal ki hoon.")
         return
 
-    # Identity
     if is_asking_if_bot_or_human(user_text):
         await update.message.reply_text(
             "Main Akane naam ka virtual chat bot hoon, real insaan nahi. "
@@ -253,7 +244,6 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
 
         if TRIGGER_NAME not in text_low and not is_reply_to_bot:
-            # Na "akane" likha, na hi bot ke message ko reply kiya -> ignore
             return
 
     # --- Groq se reply (background thread me) ---
@@ -278,10 +268,10 @@ async def img_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if not prompt:
         await update.message.reply_text(
-            "Kaisi anime image chahiye?\n"
-            "Example:\n"
-            "/img akane coffee shop me baithi hai\n"
-            "/img cute anime girl sky me stars dekh rahi hai"
+            "Kaisi anime / waifu image chahiye?\n"
+            "Examples:\n"
+            "/img akane coffee shop me baithi hai, cute anime style\n"
+            "/img cute anime girl night sky me stars dekh rahi hai"
         )
         return
 
@@ -296,7 +286,7 @@ async def img_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         image_bytes = await asyncio.to_thread(_generate_image_bytes, prompt)
     except Exception as e:
-        logger.exception("HF image error: %s", e)
+        logger.exception("Image generate thread error: %s", e)
         await waiting_msg.edit_text("Image generate nahi ho paayi, thodi der baad fir try karo.")
         return
 
@@ -319,10 +309,10 @@ def main() -> None:
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("img", img_handler))  # /img for images
+    app.add_handler(CommandHandler("img", img_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_handler))
 
-    logger.info("Akane bot started (Groq + Hugging Face)...")
+    logger.info("Akane bot started (Groq + HF/Fal image)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
