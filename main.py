@@ -39,7 +39,7 @@ if not HF_TOKEN:
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 # Groq text model
-GROQ_MODEL_NAME = "openai/gpt-oss-120b"  # ensure ye model tumhare Groq account pe available ho
+GROQ_MODEL_NAME = "llama-3.3-70b-versatile"  # ensure ye model tumhare Groq account pe available ho
 
 SYSTEM_PROMPT = """
 Tum Akane ho, ek virtual ex-girlfriend style chat bot.
